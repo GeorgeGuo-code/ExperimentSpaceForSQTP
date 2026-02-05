@@ -1,0 +1,42 @@
+version: '3.8'
+services:
+  postgres:
+    build: ./init-scripts
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: george_guo
+      POSTGRES_PASSWORD: George15041403
+      POSTGRES_DB: george_guo
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - backend_network  # 连接到自定义网络
+  
+  backend:
+    build: ./backend
+    environment:
+      DB_HOST: postgres  # PostgreSQL 服务的主机名，Docker Compose 自动处理服务间网络
+      DB_PORT: 5432
+      DB_USER: george_guo
+      DB_PASSWORD: George15041403
+      DB_NAME: george_guo
+      DB_TABLE_NAME: log_in_info
+      JWT_SECRET_KEY: 309d30128eb84675b1fdc45455c29e20
+    container_name: backend_service
+    depends_on:
+      - postgres
+    ports:
+      - "3000:3000"
+    networks:
+      - backend_network  # 连接到自定义网络
+
+volumes:
+  postgres_data:
+
+# 自定义网络
+networks:
+  backend_network:
+    driver: bridge
