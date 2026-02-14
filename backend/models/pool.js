@@ -1,4 +1,4 @@
-//数据库连接池配置
+// 连接池
 const { Pool } = require("pg");
 
 module.exports = new Pool({

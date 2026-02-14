@@ -23,7 +23,10 @@ services:
       DB_USER: george_guo
       DB_PASSWORD: George15041403
       DB_NAME: george_guo
-      DB_TABLE_NAME: log_in_info
+      DB_TABLE_NAME: users
+      DB_QUESTIONS_TABLE: questions
+      DB_TAGS_TABLE: tags
+      DB_QUESTION_TAGS_TABLE: question_tags
       JWT_SECRET_KEY: 309d30128eb84675b1fdc45455c29e20
     container_name: backend_service
     depends_on:
