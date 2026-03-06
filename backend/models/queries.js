@@ -31,6 +31,22 @@ async function registerUser(username, password){
   }
 }
 
+
+const findUserById = async (userId) => {
+  try {
+    const result = await pool.query(`SELECT * FROM ${process.env.DB_TABLE_NAME} WHERE id = $1`, [userId]);
+
+    // 如果找到用户，返回第一个用户（或者返回 null）
+    if (result.rows.length > 0) {
+      return result.rows[0];  // 返回找到的第一个用户
+    } else {
+      return null;  // 如果没有找到用户
+    }
+  } catch (error) {
+    throw error;
+  }
+};
+
 const findUserByUsername = async (username) => {
   try {
     // 使用 SQL 查询来查找数据库中的用户
@@ -49,19 +65,19 @@ const findUserByUsername = async (username) => {
 };
 
 //创建问题
-async function createQuestion(title, content, userId, tagIds = [], categoryRules = {}) {
+async function createQuestion(title, content, userId, tagIds = [], categoryRules = {}, role = 'student') {
   const client = await pool.connect();
-  
+
   try {
     await client.query('BEGIN');
-    
+
     // 1. 插入问题
     const questionQuery = `
-      INSERT INTO questions (title, content, user_id) 
-      VALUES ($1, $2, $3) 
-      RETURNING id, title, content, user_id, created_at
+      INSERT INTO questions (title, content, user_id, role)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, title, content, user_id, role, created_at
     `;
-    const questionResult = await client.query(questionQuery, [title, content, userId]);
+    const questionResult = await client.query(questionQuery, [title, content, userId, role]);
     const questionId = questionResult.rows[0].id;
     
     // 2. 验证标签并分类校验（核心修改部分）
@@ -167,9 +183,9 @@ async function getQuestionsByTagId(tagId, page = 1, limit = 20) {
 // 新增：根据问题ID获取问题及标签
 async function getQuestionWithTags(questionId) {
   const questionQuery = `
-    SELECT q.*, u.username 
-    FROM questions q 
-    JOIN users u ON q.user_id = u.id 
+    SELECT q.*, u.username, q.role
+    FROM questions q
+    JOIN users u ON q.user_id = u.id
     WHERE q.id = $1
   `;
   const questionResult = await pool.query(questionQuery, [questionId]);
@@ -182,11 +198,16 @@ async function getQuestionWithTags(questionId) {
   
   // 获取标签
   const tagsQuery = `
-    SELECT t.id, t.name 
+    SELECT t.id, t.name, t.category
     FROM tags t 
     JOIN question_tags qt ON t.id = qt.tag_id 
     WHERE qt.question_id = $1
-    ORDER BY t.name
+    ORDER BY CASE t.category
+      WHEN 'subject' THEN 1
+      WHEN 'difficulty' THEN 2
+      WHEN 'progress' THEN 3
+      ELSE 4
+    END, t.name
   `;
   const tagsResult = await pool.query(tagsQuery, [questionId]);
   
@@ -200,23 +221,27 @@ async function getQuestions(page = 1, limit = 20, tagId = null) {
     const offset = (page - 1) * limit;
     let queryParams = [limit, offset];
     let queryIndex = 3;
-    
+
     // 基础查询
     let query = `
-      SELECT q.*, u.username 
-      FROM questions q 
-      JOIN users u ON q.user_id = u.id 
+      SELECT DISTINCT q.*, u.username, q.role
+      FROM questions q
+      JOIN users u ON q.user_id = u.id
+      LEFT JOIN pairs p ON q.id = p.question_id
     `;
-    
+
+    // WHERE 条件：只显示没有结对的问题
+    query += ` WHERE p.id IS NULL`;
+
     // 如果指定了标签，添加关联
     if (tagId) {
-      query += `JOIN question_tags qt ON q.id = qt.question_id WHERE qt.tag_id = $${queryIndex}`;
+      query += ` AND q.id IN (SELECT question_id FROM question_tags WHERE tag_id = $${queryIndex})`;
       queryParams.push(tagId);
       queryIndex++;
     }
-    
-    query += ` ORDER BY q.created_at DESC LIMIT $1 OFFSET $2`;
-    
+
+    query += ` ORDER BY q.created_at DESC, q.id DESC LIMIT $1 OFFSET $2`;
+
     // 获取问题列表
     const questionsResult = await pool.query(query, queryParams);
     
@@ -224,11 +249,16 @@ async function getQuestions(page = 1, limit = 20, tagId = null) {
     const questionsWithTags = await Promise.all(
       questionsResult.rows.map(async (question) => {
         const tagsQuery = `
-          SELECT t.id, t.name 
+          SELECT t.id, t.name, t.category
           FROM tags t 
           JOIN question_tags qt ON t.id = qt.tag_id 
           WHERE qt.question_id = $1
-          ORDER BY t.name
+          ORDER BY CASE t.category
+            WHEN 'subject' THEN 1
+            WHEN 'difficulty' THEN 2
+            WHEN 'progress' THEN 3
+            ELSE 4
+          END, t.name
         `;
         const tagsResult = await pool.query(tagsQuery, [question.id]);
         question.tags = tagsResult.rows;
@@ -237,15 +267,21 @@ async function getQuestions(page = 1, limit = 20, tagId = null) {
     );
     
     // 获取总数
-    let countQuery = `SELECT COUNT(*) FROM questions`;
+    let countQuery = `
+      SELECT COUNT(DISTINCT q.id)
+      FROM questions q
+      LEFT JOIN pairs p ON q.id = p.question_id
+      WHERE p.id IS NULL
+    `;
     let countParams = [];
-    
+
     if (tagId) {
       countQuery = `
-        SELECT COUNT(DISTINCT q.id) 
-        FROM questions q 
-        JOIN question_tags qt ON q.id = qt.question_id 
-        WHERE qt.tag_id = $1
+        SELECT COUNT(DISTINCT q.id)
+        FROM questions q
+        LEFT JOIN pairs p ON q.id = p.question_id
+        WHERE p.id IS NULL
+          AND q.id IN (SELECT question_id FROM question_tags WHERE tag_id = $1)
       `;
       countParams = [tagId];
     }
@@ -264,27 +300,38 @@ async function getQuestions(page = 1, limit = 20, tagId = null) {
   }
 }
 
-// 修改：获取用户的问题（包含标签）
-async function getUserQuestions(userId) {
+// 修改：获取用户的问题（包含标签，支持分页）
+async function getUserQuestions(userId, page = 1, limit = 20) {
   try {
+    const offset = (page - 1) * limit;
+
+    // 获取分页的问题列表（只返回未结对的问题）
     const query = `
-      SELECT q.*, u.username 
-      FROM questions q 
-      JOIN users u ON q.user_id = u.id 
-      WHERE q.user_id = $1 
-      ORDER BY q.created_at DESC
+      SELECT q.*, u.username, q.role
+      FROM questions q
+      JOIN users u ON q.user_id = u.id
+      LEFT JOIN pairs p ON q.id = p.question_id
+      WHERE q.user_id = $1
+        AND p.id IS NULL
+      ORDER BY q.created_at DESC, q.id DESC
+      LIMIT $2 OFFSET $3
     `;
-    const result = await pool.query(query, [userId]);
+    const result = await pool.query(query, [userId, limit, offset]);
     
     // 为每个问题获取标签
     const questionsWithTags = await Promise.all(
       result.rows.map(async (question) => {
         const tagsQuery = `
-          SELECT t.id, t.name 
+          SELECT t.id, t.name, t.category
           FROM tags t 
           JOIN question_tags qt ON t.id = qt.tag_id 
           WHERE qt.question_id = $1
-          ORDER BY t.name
+          ORDER BY CASE t.category
+            WHEN 'subject' THEN 1
+            WHEN 'difficulty' THEN 2
+            WHEN 'progress' THEN 3
+            ELSE 4
+          END, t.name
         `;
         const tagsResult = await pool.query(tagsQuery, [question.id]);
         question.tags = tagsResult.rows;
@@ -292,9 +339,122 @@ async function getUserQuestions(userId) {
       })
     );
     
+    // 获取总数（只计算未结对的问题）
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM questions q
+      LEFT JOIN pairs p ON q.id = p.question_id
+      WHERE q.user_id = $1
+        AND p.id IS NULL
+    `;
+    const countResult = await pool.query(countQuery, [userId]);
+    
     return {
       success: true,
-      questions: questionsWithTags
+      questions: questionsWithTags,
+      total: parseInt(countResult.rows[0].total),
+      page,
+      limit
+    };
+  } catch (error) {
+    return { success: false, message: error.message };
+  }
+}
+
+// 获取用户参与的所有问题（包括创建的和参与的结对）
+async function getUserHistory(userId, page = 1, limit = 20) {
+  try {
+    const offset = (page - 1) * limit;
+
+    // 获取用户参与的所有问题（创建的 + 作为结对另一端参与的）
+    const query = `
+      WITH user_questions AS (
+        -- 用户创建的问题
+        SELECT q.*, u.username, 'created' as participation_type
+        FROM questions q
+        JOIN users u ON q.user_id = u.id
+        WHERE q.user_id = $1
+
+        UNION
+
+        -- 用户作为结对另一端参与的问题
+        SELECT q.*, u.username, 'participated' as participation_type
+        FROM questions q
+        JOIN users u ON q.user_id = u.id
+        JOIN pairs p ON p.question_id = q.id
+        WHERE (p.teacher_id = $1 OR p.student_id = $1) AND q.user_id != $1
+      )
+      SELECT DISTINCT ON (id) id, title, content, user_id, username, created_at, updated_at, role, participation_type
+      FROM user_questions
+      ORDER BY id DESC
+      LIMIT $2 OFFSET $3
+    `;
+    const result = await pool.query(query, [userId, limit, offset]);
+
+    // 为每个问题获取标签和结对状态
+    const questionsWithTags = await Promise.all(
+      result.rows.map(async (question) => {
+        // 获取标签
+        const tagsQuery = `
+          SELECT t.id, t.name, t.category
+          FROM tags t
+          JOIN question_tags qt ON t.id = qt.tag_id
+          WHERE qt.question_id = $1
+          ORDER BY CASE t.category
+            WHEN 'subject' THEN 1
+            WHEN 'difficulty' THEN 2
+            WHEN 'progress' THEN 3
+            ELSE 4
+          END, t.name
+        `;
+        const tagsResult = await pool.query(tagsQuery, [question.id]);
+        question.tags = tagsResult.rows;
+
+        // 获取结对状态
+        const pairQuery = `
+          SELECT p.status, p.ended_at
+          FROM pairs p
+          WHERE p.question_id = $1
+          ORDER BY p.created_at DESC
+          LIMIT 1
+        `;
+        const pairResult = await pool.query(pairQuery, [question.id]);
+        if (pairResult.rows.length > 0) {
+          question.pair_status = pairResult.rows[0].status;
+          question.pair_ended_at = pairResult.rows[0].ended_at;
+        } else {
+          question.pair_status = null;
+        }
+
+        return question;
+      })
+    );
+
+    // 获取总数
+    const countQuery = `
+      WITH user_questions AS (
+        SELECT q.id
+        FROM questions q
+        WHERE q.user_id = $1
+
+        UNION
+
+        SELECT q.id
+        FROM questions q
+        JOIN pairs p ON p.question_id = q.id
+        WHERE (p.teacher_id = $1 OR p.student_id = $1) AND q.user_id != $1
+      )
+      SELECT COUNT(DISTINCT id) as total
+      FROM user_questions
+    `;
+    const countResult = await pool.query(countQuery, [userId]);
+
+    return {
+      success: true,
+      questions: questionsWithTags,
+      total: parseInt(countResult.rows[0].total),
+      page,
+      limit
     };
   } catch (error) {
     return { success: false, message: error.message };
@@ -420,14 +580,14 @@ async function searchByMultipleTags(tagIds = [], page = 1, limit = 20, categoryR
     const offset = (page - 1) * limit;
     
     const searchQuery = `
-      SELECT q.*, u.username 
+      SELECT q.*, u.username, q.role
       FROM questions q
       JOIN users u ON q.user_id = u.id
       JOIN question_tags qt ON q.id = qt.question_id
       WHERE qt.tag_id IN (${placeholders})
       GROUP BY q.id, u.username
       HAVING COUNT(DISTINCT qt.tag_id) = $${tagIds.length + 1}
-      ORDER BY q.created_at DESC
+      ORDER BY q.created_at DESC, q.id DESC
       LIMIT $${tagIds.length + 2} OFFSET $${tagIds.length + 3}
     `;
     
@@ -459,7 +619,12 @@ async function searchByMultipleTags(tagIds = [], page = 1, limit = 20, categoryR
           FROM tags t
           JOIN question_tags qt ON t.id = qt.tag_id
           WHERE qt.question_id = $1
-          ORDER BY t.name
+          ORDER BY CASE t.category
+            WHEN 'subject' THEN 1
+            WHEN 'difficulty' THEN 2
+            WHEN 'progress' THEN 3
+            ELSE 4
+          END, t.name
         `;
         const tagsResult = await pool.query(tagsQuery, [question.id]);
         question.tags = tagsResult.rows;
@@ -485,7 +650,6 @@ async function searchByMultipleTags(tagIds = [], page = 1, limit = 20, categoryR
     return { success: false, message: error.message };
   }
 }
-
 // 通过id获取问题
 const getQuestionById = async (questionId) => {
   const query = 'SELECT * FROM questions WHERE id = $1';  // SQL 查询语句
@@ -500,26 +664,296 @@ const getQuestionById = async (questionId) => {
   }
 };
 
-// 通过id删除问题
-const deleteQuestion = async (questionId) => {
-  const query = 'DELETE FROM questions WHERE id = $1 RETURNING *';  // SQL 查询语句，删除问题并返回删除的记录
+// 删除问题
+async function deleteQuestion(questionId) {
+  const client = await pool.connect();
   try {
-    const result = await pool.query(query, [questionId]);
+    await client.query('BEGIN');
+    
+    // 删除问题标签关联（由于 ON DELETE CASCADE，删除问题会自动删除关联记录）
+    // 但为了安全起见，可以显式删除
+    await client.query('DELETE FROM question_tags WHERE question_id = $1', [questionId]);
+    
+    // 删除问题
+    const result = await client.query('DELETE FROM questions WHERE id = $1 RETURNING *', [questionId]);
+    
     if (result.rows.length === 0) {
-      return { success: false, message: '问题删除失败' }; // 如果没有记录被删除，返回失败
+      await client.query('ROLLBACK');
+      return { success: false, message: '问题不存在' };
     }
-    return { success: true, message: '问题已成功删除' }; // 删除成功，返回成功信息
+    
+    await client.query('COMMIT');
+    return { success: true, message: '问题已删除' };
   } catch (error) {
-    throw new Error('数据库删除失败');
+    await client.query('ROLLBACK');
+    return { success: false, message: error.message };
+  } finally {
+    client.release();
+  }
+}
+// 聊天相关的数据库查询
+const queries = {
+  // 用户相关查询
+  user: {
+    // 获取所有可用用户（排除当前用户，只返回有问题的用户）
+    getAvailableUsers: async (currentUserId) => {
+      const result = await pool.query(
+        `SELECT DISTINCT u.id, u.username, u.created_at
+         FROM users u
+         INNER JOIN questions q ON u.id = q.user_id
+         WHERE u.id != $1
+         ORDER BY u.created_at DESC`,
+        [currentUserId]
+      );
+      return result.rows;
+    }
+  },
+
+  // 结对相关查询
+  pair: {
+    // 检查是否存在结对
+    checkExisting: async (userId, targetUserId) => {
+      const result = await pool.query(
+        `SELECT * FROM pairs
+         WHERE ((teacher_id = $1 AND student_id = $2) OR (teacher_id = $2 AND student_id = $1))
+         AND status IN ('pending', 'active')`,
+        [userId, targetUserId]
+      );
+      return result.rows;
+    },
+
+    // 检查用户的总结对数量（active 和 end_requested 状态）
+    checkUserPairLimit: async (userId, limit = 5) => {
+      const result = await pool.query(
+        `SELECT COUNT(*) as count
+         FROM pairs
+         WHERE (teacher_id = $1 OR student_id = $1)
+         AND status IN ('active', 'end_requested')`,
+        [userId]
+      );
+      const currentCount = parseInt(result.rows[0].count);
+      return {
+        canCreate: currentCount < limit,
+        currentCount,
+        limit
+      };
+    },
+
+    // 创建结对申请
+    create: async (teacherId, studentId, topicId, questionId = null) => {
+      const result = await pool.query(
+        `INSERT INTO pairs (teacher_id, student_id, topic_id, status, started_at, question_id) 
+         VALUES ($1, $2, $3, 'active', NOW(), $4) RETURNING *`,
+        [teacherId, studentId, topicId, questionId]
+      );
+      return result.rows[0];
+    },
+
+    // 接受结对申请
+    accept: async (pairId) => {
+      const result = await pool.query(
+        `UPDATE pairs SET status = 'active', started_at = NOW() 
+         WHERE id = $1 RETURNING *`,
+        [pairId]
+      );
+      return result.rows[0];
+    },
+
+    // 获取用户的结对列表
+    getByUserId: async (userId) => {
+    try {
+      console.log('获取用户结对列表，用户ID:', userId);
+    
+      const result = await pool.query(
+          `SELECT p.*, 
+              CASE 
+                  WHEN p.teacher_id = $1 THEN u_student.username 
+                  ELSE u_teacher.username 
+              END as partner_username
+           FROM pairs p
+           LEFT JOIN users u_teacher ON p.teacher_id = u_teacher.id
+           LEFT JOIN users u_student ON p.student_id = u_student.id
+           WHERE p.teacher_id = $1 OR p.student_id = $1
+           ORDER BY p.created_at DESC`,
+          [userId]
+      );
+      return result.rows;
+    } catch (err) {
+      console.error('获取用户结对列表失败:', err);
+      throw err;
+    }
+  },
+
+  // 根据问题ID查找结对
+  getByQuestionId: async (questionId) => {
+    try {
+      const result = await pool.query(
+        `SELECT p.*,
+                  CASE
+                    WHEN p.teacher_id = u_teacher.id THEN u_student.username
+                    ELSE u_teacher.username
+                  END as partner_username
+           FROM pairs p
+           LEFT JOIN users u_teacher ON p.teacher_id = u_teacher.id
+           LEFT JOIN users u_student ON p.student_id = u_student.id
+           WHERE p.question_id = $1
+           ORDER BY p.created_at DESC
+           LIMIT 1`,
+          [questionId]
+      );
+      return result.rows[0] || null;
+    } catch (err) {
+      console.error('根据问题ID查找结对失败:', err);
+      throw err;
+    }
+  },
+  // 关联问题ID到结对
+  associateQuestion: async (pairId, questionId) => {
+    try {
+      const result = await pool.query(
+        'UPDATE pairs SET question_id = $1 WHERE id = $2 RETURNING *',
+        [questionId, pairId]
+      );
+      return result.rows[0];
+    } catch (err) {
+      console.error('关联问题ID失败:', err);
+      throw err;
+    }
+  },
+    // 根据ID获取结对
+    getById: async (pairId) => {
+      const result = await pool.query(
+        'SELECT * FROM pairs WHERE id = $1',
+        [pairId]
+      );
+      return result.rows[0];
+    },
+
+    // 结束教学
+    end: async (pairId) => {
+      const result = await pool.query(
+        `UPDATE pairs SET status = 'completed', ended_at = NOW()
+         WHERE id = $1 RETURNING *`,
+        [pairId]
+      );
+      return result.rows[0];
+    },
+
+    // 申请结束教学
+    requestEnd: async (pairId, userId) => {
+      const result = await pool.query(
+        `UPDATE pairs
+         SET status = 'end_requested',
+             end_requested_by = $2,
+             end_request_status = 'pending',
+             end_requested_at = NOW()
+         WHERE id = $1
+           AND status = 'active'
+         RETURNING *`,
+        [pairId, userId]
+      );
+      return result.rows[0];
+    },
+
+    // 同意结束请求
+    acceptEndRequest: async (pairId) => {
+      const result = await pool.query(
+        `UPDATE pairs
+         SET status = 'completed',
+             end_request_status = 'accepted',
+             ended_at = NOW()
+         WHERE id = $1
+           AND status = 'end_requested'
+           AND end_request_status = 'pending'
+         RETURNING *`,
+        [pairId]
+      );
+      return result.rows[0];
+    },
+
+    // 拒绝结束请求
+    rejectEndRequest: async (pairId) => {
+      const result = await pool.query(
+        `UPDATE pairs
+         SET status = 'active',
+             end_request_status = 'rejected',
+             end_requested_by = NULL,
+             end_requested_at = NULL
+         WHERE id = $1
+           AND status = 'end_requested'
+           AND end_request_status = 'pending'
+         RETURNING *`,
+        [pairId]
+      );
+      return result.rows[0];
+    },
+
+    // 获取用户的待处理结束申请
+    getPendingEndRequests: async (userId) => {
+      const result = await pool.query(
+        `SELECT
+          p.id as pair_id,
+          p.teacher_id,
+          p.student_id,
+          p.end_requested_by,
+          p.end_requested_at,
+          q.id as question_id,
+          q.title as question_title,
+          q.content as question_content,
+          CASE
+            WHEN p.teacher_id = $1 THEN u_student.username
+            ELSE u_teacher.username
+          END as requester_username
+         FROM pairs p
+         LEFT JOIN users u_teacher ON p.teacher_id = u_teacher.id
+         LEFT JOIN users u_student ON p.student_id = u_student.id
+         LEFT JOIN questions q ON p.question_id = q.id
+         WHERE p.status = 'end_requested'
+           AND p.end_request_status = 'pending'
+           AND (p.teacher_id = $1 OR p.student_id = $1)
+           AND p.end_requested_by != $1
+         ORDER BY p.end_requested_at DESC`,
+        [userId]
+      );
+      return result.rows;
+    }
+  },
+
+  // 消息相关查询
+  message: {
+    // 创建消息
+    create: async (pairId, senderId, content) => {
+      const result = await pool.query(
+        `INSERT INTO messages (pair_id, sender_id, content) 
+         VALUES ($1, $2, $3) RETURNING *`,
+        [pairId, senderId, content]
+      );
+      return result.rows[0];
+    },
+
+    // 获取结对的聊天记录
+    getByPairId: async (pairId) => {
+      const result = await pool.query(
+        `SELECT m.*, u.username as sender_nickname
+         FROM messages m
+         JOIN users u ON m.sender_id = u.id
+         WHERE m.pair_id = $1
+         ORDER BY m.created_at ASC`,
+        [pairId]
+      );
+      return result.rows;
+    }
   }
 };
-
 module.exports = {
+  ...queries,
   registerUser,
+  findUserById,
   findUserByUsername,
-  createQuestion,    
-  getQuestions,      
-  getUserQuestions,   
+  createQuestion,
+  getQuestions,
+  getUserQuestions,
+  getUserHistory,
   getAvailableTags,
   getQuestionsByTagId,
   getQuestionWithTags,

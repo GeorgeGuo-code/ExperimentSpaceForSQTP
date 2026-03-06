@@ -1,5 +1,6 @@
 const { Router } = require('express');
 const usersController = require('../controllers/usersController')
+const { verifyJWT } = require('../middlewares/usersMiddleware');
 const usersRouter = Router();
 
 
@@ -14,6 +15,12 @@ usersRouter.post('/api/login', async (req, res) => {
 
 // 验证JWT
 usersRouter.post('/api/verify-token', usersController.verifyUserToken);
+
+// 修改密码（需要JWT验证）
+usersRouter.post('/api/users/:userId/change-password', verifyJWT, usersController.updatePassword);
+
+// 获取可用用户列表（需要JWT验证）
+usersRouter.get('/api/users/available', verifyJWT, usersController.getAvailableUsers);
 
 
 module.exports = usersRouter;

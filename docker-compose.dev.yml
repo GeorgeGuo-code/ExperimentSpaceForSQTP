@@ -1,0 +1,61 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:14.20
+    container_name: postgres_db_dev
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-george_guo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-George15041403}
+      POSTGRES_DB: ${POSTGRES_DB:-george_guo}
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - backend_network
+
+  backend:
+    build: ./backend
+    container_name: backend_service_dev
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-george_guo}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-George15041403}
+      DB_NAME: ${POSTGRES_DB:-george_guo}
+      DB_TABLE_NAME: users
+      DB_QUESTIONS_TABLE: questions
+      DB_TAGS_TABLE: tags
+      DB_QUESTION_TAGS_TABLE: question_tags
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-309d30128eb84675b1fdc45455c29e20}
+    depends_on:
+      - postgres
+    ports:
+      - "3000:3000"
+    networks:
+      - backend_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: frontend_service_dev
+    volumes:
+      - ./frontend/src:/app/src
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:3000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - backend_network
+
+volumes:
+  postgres_data_dev:
+
+networks:
+  backend_network:
+    driver: bridge
